@@ -2,6 +2,11 @@
 
 One entry per released version, newest first.
 
+## v0.4.0 — 2026-11-12
+
+- `cmd/pllpace`: a real-time pacing loop that reports the rate it achieved and how late each wake-up ran. It can compare one timer tick per unit, send units over UDP, and search for the highest rate it sustains (`-find-max`).
+- Benchmarks comparing slot times read from a `Span` with the same times computed with `big.Rat`.
+
 ## v0.3.2 — 2026-11-12
 
 Documentation only. The README now says that `Span.Time` reports a slot's scheduled time rounded down to whole nanoseconds, as its reference section always did. v0.3.1 was tagged on the v0.3.0 commit by mistake, so it is identical to v0.3.0 and is retracted.
