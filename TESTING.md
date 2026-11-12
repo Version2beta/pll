@@ -26,6 +26,7 @@ CI runs `make verify`'s steps on Go 1.23 and on the current release, and fuzzes 
 | `followerproof_test.go` | The differential test against the loop model, invariants on random and fuzzed readings (`FuzzFollower`), zero allocations, the simulator scenarios with their thresholds, the device sink, and late wake-ups |
 | `example_test.go`, `example_follower_test.go` | The examples on pkg.go.dev, run as tests |
 | `bench_test.go` | Benchmarks: one slot per call, 64 slots per call, with a trim, and claiming by bytes |
+| `bench_compare_test.go` | The same exact slot times at 30000/1001 per second, read from a `Span` and computed with `big.Rat`, for comparison |
 
 ## Reference models
 
@@ -89,6 +90,18 @@ A failure is saved under `testdata/fuzz/` and replays on every `go test` from th
 | aging-crystal | +10 ppm, drifting 1 ppm per hour, for 2 hours | RMS error ≤ 20 µs; rate within 4 ppm |
 | device-sink | A device consuming 40 ppm fast, the pacer linked by queue level | Queue stays within 10 units for 5 minutes; unlinked, it drifts by more than 400 |
 | late-wakeups | The pacer woken up to 20 ms late | Every due slot handed out exactly once, none early |
+
+## Measuring a pacing loop
+
+The benchmarks time single calls. `cmd/pllpace` times a whole loop: it sleeps until the next slot is due, hands out what is due, writes each unit to an output, and reports the rate it achieved, how far behind schedule it ended, and how late the oldest unit was at each wake-up.
+
+```sh
+go run ./cmd/pllpace -seconds 5
+go run ./cmd/pllpace -mode ticker -seconds 5
+go run ./cmd/pllpace -find-max -seconds 2 -udp loopback
+```
+
+`-mode ticker` uses one timer tick per unit instead of the pacer, for comparison. `-find-max` doubles the rate until a trial ends more than `-slack` (5 ms) behind schedule, or its 99th-percentile lateness exceeds it, then narrows the range to within 5%. `-udp loopback` sends each unit to a UDP receiver in the same process; `-per-datagram` groups units into larger datagrams. Results depend on the machine and are noisy near the limit, so run a search more than once.
 
 ## Plant a bug yourself
 

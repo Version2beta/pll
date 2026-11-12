@@ -253,6 +253,13 @@ The loop equations, and every rule above in full, are in the [specification](htt
    go test -run TestDifferential
    ```
    The test fails immediately. It shows what the pacer returned, what the reference returned, and the operations that led there. Undo the change with `git checkout pacer.go`.
+4. Measure it on your machine. `make bench` reports the cost of each call, including the same slot times computed with `big.Rat` for comparison. `cmd/pllpace` runs a real pacing loop and reports the rate it achieved and how late each wake-up ran; with `-find-max` it searches for the highest rate the loop sustains:
+   ```sh
+   make bench
+   go run ./cmd/pllpace -seconds 5
+   go run ./cmd/pllpace -find-max -seconds 2 -udp loopback
+   ```
+   With `-udp loopback`, every unit is sent as a UDP datagram to a receiver in the same process, so the result includes the cost of the send. Without it, units are discarded and the result is the pacing loop alone. Run `go run ./cmd/pllpace -h` for the other settings.
 
 ## How it compares
 
