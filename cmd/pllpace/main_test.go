@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -257,6 +258,50 @@ func TestSinkCountsBytesWithError(t *testing.T) {
 	out := &sink{w: w, per: 1, size: 2}
 	if err := out.unit([]byte{1, 2}); !errors.Is(err, failure) || out.written != 1 || len(out.buf) != 0 {
 		t.Fatalf("partial failure: %v, bytes=%d, pending=%d", err, out.written, len(out.buf))
+	}
+}
+
+func TestBisectRate(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		lo, hi, highestPassing uint64
+		wantLo, wantHi         uint64
+		wantTrials             []uint64
+	}{
+		{"adjacent minimum", 1, 2, 1, 1, 2, nil},
+		{"adjacent below five percent precision", 19, 20, 19, 19, 20, nil},
+		{"at five percent", 20, 21, 20, 20, 21, nil},
+		{"failing midpoint reaches adjacency", 1, 4, 1, 1, 2, []uint64{2}},
+		{"passing midpoint reaches adjacency", 1, 4, 2, 2, 3, []uint64{2, 3}},
+		{"multiple steps to adjacency", 1, 8, 2, 2, 3, []uint64{4, 2, 3}},
+		{"five percent before adjacency", 1_000_000, 2_000_000, 1_500_000, 1_500_000, 1_562_500, []uint64{1_500_000, 1_750_000, 1_625_000, 1_562_500}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var trials []uint64
+			previousLo, previousHi := tc.lo, tc.hi
+			lo, hi := bisectRate(tc.lo, tc.hi, func(rate uint64) bool {
+				// Fail synchronously on a repeated endpoint, rather than hang
+				// if integer rounding prevents the production loop advancing.
+				if rate <= previousLo || rate >= previousHi {
+					t.Fatalf("trial %d outside open bracket (%d, %d)", rate, previousLo, previousHi)
+				}
+				trials = append(trials, rate)
+				if len(trials) > len(tc.wantTrials) {
+					t.Fatalf("too many trials: %v", trials)
+				}
+				pass := rate <= tc.highestPassing
+				if pass {
+					previousLo = rate
+				} else {
+					previousHi = rate
+				}
+				return pass
+			})
+			if lo != tc.wantLo || hi != tc.wantHi || !slices.Equal(trials, tc.wantTrials) {
+				t.Fatalf("bisectRate = (%d, %d), trials %v; want (%d, %d), trials %v",
+					lo, hi, trials, tc.wantLo, tc.wantHi, tc.wantTrials)
+			}
+		})
 	}
 }
 

@@ -26,7 +26,7 @@ CI runs `make verify`'s steps on Go 1.23 and on the current release, and fuzzes 
 | `followerproof_test.go` | The differential test against the loop model, invariants on random and fuzzed readings (`FuzzFollower`), zero allocations, the simulator scenarios with their thresholds, the device sink, and late wake-ups |
 | `example_test.go`, `example_follower_test.go` | The examples on pkg.go.dev, run as tests |
 | `readme_test.go` | The README pacing helper matches the compiled helper and cancels when its consumer stops |
-| `cmd/pllpace/main_test.go` | Flag boundaries, writer errors and short writes, final partial groups, trial isolation and deadlines |
+| `cmd/pllpace/main_test.go` | Flag boundaries, writer errors and short writes, final partial groups, trial isolation and deadlines, deterministic maximum-rate bisection progress and termination |
 | `internal/sim/sim_test.go` | Independent late-wakeup totals, including fractional rates and a capped run that leaves a backlog |
 | `bench_test.go` | Benchmarks: one slot per call, 64 slots per call, with a trim, and claiming by bytes |
 | `bench_compare_test.go` | The same exact slot times at 30000/1001 per second, read from a `Span` and computed with `big.Rat`, for comparison |
@@ -104,7 +104,7 @@ go run ./cmd/pllpace -mode ticker -seconds 5
 go run ./cmd/pllpace -find-max -seconds 2 -udp loopback
 ```
 
-`-mode ticker` uses one timer tick per unit instead of the pacer, for comparison. `-find-max` requires a nonempty trial and doubles the rate until a trial ends more than `-slack` (5 ms) behind schedule, or its 99th-percentile lateness exceeds it, then narrows the range to within 5%. `-udp loopback` sends each unit to a UDP receiver in the same process; `-per-datagram` groups units into larger datagrams. Each trial flushes its final partial group; elapsed time and byte counts include that write. Write errors (including short writes) stop the run, and buffered bytes never carry into the next trial. Offered units are units passed to the sink; writer-accepted bytes count the bytes returned by `Write`, not UDP acknowledgment or receiver delivery. Rates include the whole trial, not just the last wake-up. Invalid sizes, durations, modes and unrepresentable ticker periods are rejected before opening sockets. Results depend on the machine and are noisy near the limit, so run a search more than once.
+`-mode ticker` uses one timer tick per unit instead of the pacer, for comparison. `-find-max` requires a nonempty trial and doubles the rate until a trial ends more than `-slack` (5 ms) behind schedule, or its 99th-percentile lateness exceeds it, then narrows the range to within 5% or to adjacent integer bit rates. If integer resolution prevents reaching 5%, it reports that limit and the exact passing/failing bit rates. `-udp loopback` sends each unit to a UDP receiver in the same process; `-per-datagram` groups units into larger datagrams. Each trial flushes its final partial group; elapsed time and byte counts include that write. Write errors (including short writes) stop the run, and buffered bytes never carry into the next trial. Offered units are units passed to the sink; writer-accepted bytes count the bytes returned by `Write`, not UDP acknowledgment or receiver delivery. Rates include the whole trial, not just the last wake-up. Invalid sizes, durations, modes and unrepresentable ticker periods are rejected before opening sockets. Results depend on the machine and are noisy near the limit, so run a search more than once.
 
 ## Plant a bug yourself
 

@@ -357,8 +357,9 @@ func main() {
 }
 
 // maxRate doubles the rate from -bps until a trial fails, then bisects to
-// within 5%. A trial passes when it ends no more than -slack behind schedule
-// and the 99th percentile of per-wake-up lateness is within -slack.
+// within 5% or to adjacent integer bit rates. A trial passes when it ends no
+// more than -slack behind schedule and the 99th percentile of per-wake-up
+// lateness is within -slack.
 func maxRate(dur time.Duration, out *sink, where string) {
 	fmt.Printf("searching for the highest sustained rate: %d-byte units, %v per trial, pass if within %v of schedule (%s)\n",
 		*unitBytes, dur, *slack, where)
@@ -395,7 +396,18 @@ func maxRate(dur time.Duration, out *sink, where string) {
 		fmt.Printf("every rate up to %.0f Mbps passed\n", float64(lo)/1e6)
 		return
 	}
-	for float64(hi)/float64(lo) > 1.05 {
+	lo, hi = bisectRate(lo, hi, trial)
+	fmt.Printf("highest rate sustained: %.1f Mbps (%.0f units/s); %.1f Mbps failed\n",
+		float64(lo)/1e6, float64(lo)/float64(*unitBytes*8), float64(hi)/1e6)
+	if float64(hi)/float64(lo) > 1.05 {
+		fmt.Printf("search stopped at integer bit-rate resolution: %d bps passed, %d bps failed (range still wider than 5%%)\n", lo, hi)
+	}
+}
+
+// bisectRate narrows a passing/failing bracket of positive integer bit rates
+// to within 5% or until no integer rate lies strictly between the endpoints.
+func bisectRate(lo, hi uint64, trial func(uint64) bool) (uint64, uint64) {
+	for hi-lo > 1 && float64(hi)/float64(lo) > 1.05 {
 		mid := lo + (hi-lo)/2
 		if trial(mid) {
 			lo = mid
@@ -403,6 +415,5 @@ func maxRate(dur time.Duration, out *sink, where string) {
 			hi = mid
 		}
 	}
-	fmt.Printf("highest rate sustained: %.1f Mbps (%.0f units/s); %.1f Mbps failed\n",
-		float64(lo)/1e6, float64(lo)/float64(*unitBytes*8), float64(hi)/1e6)
+	return lo, hi
 }
