@@ -164,7 +164,7 @@ func NewPacer(r Rate) (*Pacer, error) {
 // Due hands out the oldest slots whose exact time is at or before now, at most
 // max of them, and moves the cursor past them. When nothing is due it returns
 // a Span with Count 0 and First at the cursor. A now earlier than before is
-// not an error; it finds nothing new.
+// not an error and never rewinds; it may still hand out a backlog due at now.
 //
 // Errors: ErrInvalidArgument when now < 0 or max is 0; ErrOverflow when the
 // cursor has reached math.MaxUint64 and that slot is due. On error nothing
@@ -196,7 +196,7 @@ func (p *Pacer) Due(now time.Duration, max uint64) (Span, error) {
 // cursor past them.
 //
 // Errors: ErrInvalidArgument when n is 0; ErrOverflow when the span would
-// reach slot math.MaxUint64 or its last slot's time would exceed the largest
+// reach slot math.MaxUint64 or its last slot's floored time would exceed the largest
 // time.Duration. On error nothing changes.
 func (p *Pacer) Claim(n uint64) (Span, error) {
 	if n == 0 {

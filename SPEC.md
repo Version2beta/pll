@@ -15,7 +15,8 @@ standard library only.
 The package keeps time; it never touches payloads. It never reads a clock,
 starts a goroutine, sleeps, or does I/O. Every call that depends on the
 present takes `now time.Duration`, elapsed from an origin the caller chooses.
-Values are not safe for concurrent use.
+A `Pacer` or `Follower` is not safe for concurrent use. A `Rate` and a
+read-only issued `Span` may be shared.
 
 ### 1.2 Rate
 
@@ -66,11 +67,12 @@ denominator in `r` returns `nil, ErrInvalidRate`.
 4. Otherwise hand out slots `cursor … min(L, MaxUint64−1)`, at most `max` of
    them, oldest first, and move the cursor past them.
 
-An earlier `now` than a previous call is not an error; it finds nothing new.
+An earlier `now` than a previous call is not an error and never rewinds the
+cursor. It may still hand out a backlog of slots due at that earlier time.
 
 `Claim(n) (Span, error)`: hand out the next `n` slots whether or not they are
 due. `n == 0`: `ErrInvalidArgument`. `n > MaxUint64 − cursor`, or the last
-slot's time does not fit: `ErrOverflow`.
+slot's floored time does not fit: `ErrOverflow`.
 
 `Skip(now, keep) (uint64, error)`: let `D` be the number of slots that `Due`
 could hand out at `now` (ignoring `max`). Move the cursor past
@@ -99,8 +101,11 @@ Every call that returns an error changes nothing.
 
 ### 1.5 Span
 
-`Span{First, Count}` covers slots `First … First+Count−1`. It carries the
+An issued `Span` covers slots `First … First+Count−1`. It carries the
 segment it was issued under: a later `SetTrim` never changes its times.
+Copy it freely, but treat it as read-only when sharing: `First` and `Count`
+are writable fields. Timing guarantees apply to spans issued by a `Pacer`,
+not arbitrary struct literals or field modifications.
 
 - `Time(i)`: `floor(T(First+i))` as a `time.Duration`. Panics when
   `i >= Count`, with a message like an index out of range.
@@ -130,10 +135,13 @@ formula in 1.3; the tests compare against it.
 
 ### 1.7 Allocation
 
-For everyday rates (num and den below 2^32) with or without a trim of ±50 ppm,
-`Due`, `Claim`, `Skip`, `NextDue` and `Span.Time` do not allocate. The
-segment is an immutable value made once per `NewPacer` or `SetTrim`, and
-spans share it.
+When the segment's reduced period numerator and denominator both fit in
+`uint64`, valid calls to `Due`, `Claim`, `Skip`, `NextDue` and `Span.Time`
+do not allocate. This includes rates such as 48000/1, 30000/1001 and
+6250000/1, untrimmed or with ±50 ppm trims. Merely having rate terms below
+2^32 does not guarantee this: 4294967295/4294967291 at +50 ppm uses the
+allocating `math/big` fallback, while remaining exact. The segment is an
+immutable value made once per `NewPacer` or changed `SetTrim`, and spans share it.
 
 ### 1.8 Errors
 
@@ -235,7 +243,8 @@ positive when the reading arrived later than predicted.
    later, so the reading with the smallest error is the least delayed.
 
 A pending reading has `Error` 0. `Observation.Error` is the phase error of
-the sample fed to the loop, rounded to the nearest nanosecond.
+the sample fed to the loop, rounded to the nearest nanosecond and saturated
+at the limits of `time.Duration`.
 
 ### 2.5 Feeding a sample
 
@@ -273,11 +282,18 @@ and set the state to `StateAcquiring`.
 
 ### 2.6 Reading the follower
 
-- `Local(remote)`: `L̂(remote)` rounded to the nearest nanosecond.
-  `ErrNotAnchored` before the first reading; `ErrOverflow` if it does not fit.
+- `Local(remote)`: let `I0` be the integer nanosecond part of `L0`.
+  Round the displacement `L̂(remote) − I0` (including the anchor's fraction)
+  to the nearest nanosecond, ties away from zero, then add `I0`.
+  `ErrNotAnchored` before the first reading; `ErrOverflow` if the result does not fit.
 - `Remote(local)`: `R0 + round((local − L0) × (1 + y) / Pn)`, the inverse.
-  Same errors.
-- `Offset()`: `y`. `Trim()`: `round(y × 10^12)`, ready for `Pacer.SetTrim`.
+  Round the displacement to the nearest tick, ties away from zero, before
+  adding the integer anchor `R0`. Same errors.
+  For example, with a 0.5 ns period and anchor `(local=1, remote=0)`,
+  `Local(-1)` is `1 + round(-0.5) = 0`, not a rounded absolute time of 1.
+  With anchor `(local=-1, remote=0)`, `Local(1)` is `-1 + round(0.5) = 0`.
+- `Offset()`: `y`. `Trim()`: `round(y × 10^12)`, saturated to
+  ±(10^12 − 1) so rounding near the offset limits remains valid for `Pacer.SetTrim`.
 - `Jitter()`: `round(√m)` nanoseconds once two samples have been accepted
   since the last anchor, step or `Reset`; 0 before.
 - `State(now)`: `StateHoldover` when anchored and `now − last accepted >

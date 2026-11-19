@@ -11,6 +11,7 @@ package sim
 
 import (
 	"math"
+	"math/big"
 	"math/rand/v2"
 	"sort"
 	"time"
@@ -417,10 +418,22 @@ func RunLateWakeups(rate pll.Rate, wake, maxLate, d time.Duration, seed uint64) 
 		next = sp.First + sp.Count
 		res.HandedOut += sp.Count
 	}
-	slot, _, err := p.NextDue()
-	if err != nil {
-		return res, err
+	if len(wakes) == 0 {
+		return res, nil
 	}
-	res.Expected = slot
+	// Independently count slots at or before the final actual wake, including
+	// slot zero: floor(now * Num / (Den * 1e9)) + 1. Do not use the cursor,
+	// which would hide a backlog left by Due's per-wake cap.
+	var n, den big.Int
+	n.SetInt64(int64(wakes[len(wakes)-1]))
+	n.Mul(&n, new(big.Int).SetUint64(rate.Num()))
+	den.SetUint64(rate.Den())
+	den.Mul(&den, big.NewInt(1e9))
+	n.Quo(&n, &den)
+	n.Add(&n, big.NewInt(1))
+	if !n.IsUint64() {
+		return res, pll.ErrOverflow
+	}
+	res.Expected = n.Uint64()
 	return res, nil
 }

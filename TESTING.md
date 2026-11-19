@@ -1,6 +1,6 @@
 # Testing pll
 
-The tests check the behavior written in [SPEC.md](https://github.com/Version2beta/pll/blob/main/SPEC.md). They use only the exported API, so they hold any correct implementation to the same standard.
+The tests check the behavior written in [SPEC.md](https://github.com/Version2beta/pll/blob/main/SPEC.md). The library tests use only the exported API, so they hold any correct implementation to the same standard.
 
 ## Running them
 
@@ -18,21 +18,25 @@ CI runs `make verify`'s steps on Go 1.23 and on the current release, and fuzzes 
 | File | Checks |
 | --- | --- |
 | `rate_test.go` | `UnitsPerSecond` and `BitsPerSecond` reduce to lowest terms and reject zeros; `Rate.String` |
-| `pacer_test.go` | Each `Pacer` method on hand-worked cases: exact floor times, the ceiling in `NextDue`, `Due`'s limits, `Skip`, `SetTrim` anchoring at the floor and leaving issued spans alone, every overflow edge |
+| `pacer_test.go` | Each `Pacer` method on hand-worked cases: exact floor times, the ceiling in `NextDue`, capped backlog at an earlier `now`, `Skip`, trim anchoring and retained/shared span timing, floor-fit versus ceiling-overflow boundaries |
 | `model_test.go` | The naive pacer model, and the harness that drives it beside the real `Pacer` and checks invariants after every operation |
-| `proof_test.go` | Boundary cases at the numeric limits, the randomized differential test, `FuzzPacer`, and zero allocations on the hot paths |
-| `follower_test.go` | Each part of the `Follower` on hand-worked cases: config validation, anchoring, order, lock and holdover, window, outliers and steps, jitter, `Reset`, and precision past 2^53 ns and over 1000 simulated days |
+| `proof_test.go` | Boundary cases at the numeric limits, a wide reduced period despite 32-bit rate terms, the randomized differential test, `FuzzPacer`, and zero allocations for representative fast-path periods |
+| `follower_test.go` | Config validation and ordering, anchoring, reading order including pending/rejected samples, lock/holdover and window boundaries, outlier runs, jitter/reset, overflow atomicity, wide-displacement mappings against an integer oracle, extreme finite gains against high-precision arithmetic, trim/error saturation, and precision past 2^53 ns and over 1000 simulated days |
 | `followermodel_test.go` | The literal model of the loop equations |
 | `followerproof_test.go` | The differential test against the loop model, invariants on random and fuzzed readings (`FuzzFollower`), zero allocations, the simulator scenarios with their thresholds, the device sink, and late wake-ups |
 | `example_test.go`, `example_follower_test.go` | The examples on pkg.go.dev, run as tests |
+| `readme_test.go` | The README pacing helper matches the compiled helper and cancels when its consumer stops |
+| `cmd/pllpace/main_test.go` | Flag boundaries, writer errors and short writes, final partial groups, trial isolation and deadlines, deterministic maximum-rate bisection progress and termination |
+| `internal/sim/sim_test.go` | Independent late-wakeup totals, including fractional rates and a capped run that leaves a backlog |
 | `bench_test.go` | Benchmarks: one slot per call, 64 slots per call, with a trim, and claiming by bytes |
+| `bench_compare_test.go` | The same exact slot times at 30000/1001 per second, read from a `Span` and computed with `big.Rat`, for comparison |
 
 ## Reference models
 
-A reference model is a second implementation written to be obviously right rather than fast. When the two disagree, the fast one is wrong.
+A reference model is a second implementation written to be obviously right rather than fast. When the two disagree, investigate both against SPEC.md; the simpler model is an oracle, not a proof that it cannot be wrong.
 
 - **Pacer.** `model_test.go` recomputes every slot time from the formula in SPEC.md 1.3 with `big.Rat`, from scratch, on every call. It has no fast path and never reduces a fraction. It even checks its own answer to "which slot is due" against the neighboring slots. The differential test and the fuzz target run the real `Pacer` and the model through the same operations and compare every result, error included.
-- **Follower.** `followermodel_test.go` applies the loop equations from SPEC.md 2.5 literally, with no window, outliers, lock or jitter. The differential test feeds both the same noisy readings, with outlier rejection and the clamp out of the way, and compares the error, the rate estimate and the mapping after every reading.
+- **Follower.** `followermodel_test.go` applies the loop equations from SPEC.md 2.5 literally, with no window, outliers, lock or jitter. The differential test feeds both the same noisy readings, with outlier rejection and the clamp out of the way, and compares the error, the rate estimate and the mapping after every reading. That float64 model is used at moderate times and gains, not as an oracle at numeric extremes; hand-worked and high-precision boundary tests cover those separately.
 - **Simulator.** `internal/sim` adds an independent least-squares line fit through the readings, so the scenarios check the follower's rate estimate against a method that shares none of its code.
 
 ## Invariants
@@ -51,7 +55,7 @@ After every follower reading:
 - the rate estimate stays within `MaxOffsetPPM`;
 - `Local` never decreases as remote ticks increase;
 - an accepted update moves the phase by at most the error that caused it;
-- a rejected or pending reading changes nothing;
+- a rejected or pending reading leaves the clock mapping unchanged; reading-order, window and outlier metadata may change;
 - a step anchors exactly on the stepping reading.
 
 ## Why the pacer is exact
@@ -89,6 +93,18 @@ A failure is saved under `testdata/fuzz/` and replays on every `go test` from th
 | aging-crystal | +10 ppm, drifting 1 ppm per hour, for 2 hours | RMS error ≤ 20 µs; rate within 4 ppm |
 | device-sink | A device consuming 40 ppm fast, the pacer linked by queue level | Queue stays within 10 units for 5 minutes; unlinked, it drifts by more than 400 |
 | late-wakeups | The pacer woken up to 20 ms late | Every due slot handed out exactly once, none early |
+
+## Measuring a pacing loop
+
+The benchmarks time single calls. `cmd/pllpace` times a whole loop: it sleeps until the next slot is due, hands out what is due, writes each unit to an output, and reports offered units, writer-accepted bytes and their rate, how far behind schedule it ended, and how late the oldest unit was at each wake-up.
+
+```sh
+go run ./cmd/pllpace -seconds 5
+go run ./cmd/pllpace -mode ticker -seconds 5
+go run ./cmd/pllpace -find-max -seconds 2 -udp loopback
+```
+
+`-mode ticker` uses one timer tick per unit instead of the pacer, for comparison. `-find-max` requires a nonempty trial and doubles the rate until a trial ends more than `-slack` (5 ms) behind schedule, or its 99th-percentile lateness exceeds it, then narrows the range to within 5% or to adjacent integer bit rates. If integer resolution prevents reaching 5%, it reports that limit and the exact passing/failing bit rates. `-udp loopback` sends each unit to a UDP receiver in the same process; `-per-datagram` groups units into larger datagrams. Each trial flushes its final partial group; elapsed time and byte counts include that write. Write errors (including short writes) stop the run, and buffered bytes never carry into the next trial. Offered units are units passed to the sink; writer-accepted bytes count the bytes returned by `Write`, not UDP acknowledgment or receiver delivery. Rates include the whole trial, not just the last wake-up. Invalid sizes, durations, modes and unrepresentable ticker periods are rejected before opening sockets. Results depend on the machine and are noisy near the limit, so run a search more than once.
 
 ## Plant a bug yourself
 

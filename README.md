@@ -18,16 +18,16 @@ pll has a part for each, and they work alone or together.
 - A **Pacer** numbers evenly spaced slots at an exact rate and tells you which slots are due. Each slot's time is computed from its number with exact rational arithmetic, so it never drifts.
 - A **Follower** is a phase-locked loop. Fed readings of another clock taken against your own, it estimates how far apart the two clocks are and how fast the other one runs. It filters out jitter, rejects outliers, notices when the other clock jumps, and translates times in both directions. Its trim can drive a Pacer.
 
-The package never reads a clock, starts a goroutine or touches your data. You pass the time in, as a `time.Duration` from an origin you choose, and the hot paths allocate nothing.
+The package never reads a clock, starts a goroutine or touches your data. You pass the time in, as a `time.Duration` from an origin you choose, and the everyday-rate hot paths avoid allocations (see the limits below).
 
 ## At a glance
 
 | | |
 |---|---|
-| Version | v0.3.2 |
+| Version | v0.4.0 |
 | Go | 1.23 or newer; standard library only |
 | License | MIT |
-| Install | `go get github.com/version2beta/pll@v0.3.2` |
+| Install | `go get github.com/version2beta/pll@v0.4.0` |
 | Repository | [github.com/version2beta/pll](https://github.com/version2beta/pll) |
 | API reference | [pkg.go.dev/github.com/version2beta/pll](https://pkg.go.dev/github.com/version2beta/pll) |
 
@@ -95,7 +95,11 @@ func pace(ctx context.Context, p *pll.Pacer, out chan<- pll.Span) error {
 				return err
 			}
 			if span.Count > 0 {
-				out <- span
+				select {
+				case out <- span:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 		}
 	}
@@ -173,7 +177,7 @@ In the simulator, a linked pacer holds the device's queue within one unit for fi
 ### Slots
 
 - Slot `s` is at exactly `s × den × 10⁹ / num` nanoseconds from the origin; `Span.Time` reports the floor. A slot is due when its exact time is at or before `now`, compared without rounding: a slot at 8/3 ns has time 2 ns but is due from 3 ns.
-- The cursor marks the next slot not yet handed out or skipped. It never moves back, so an earlier `now` than before finds nothing new and is not an error.
+- The cursor marks the next slot not yet handed out or skipped. It never moves back. An earlier `now` is not an error; it may still hand out a backlog due at that earlier time.
 - `Due(now, max)` hands out the oldest due slots, at most `max`. `Claim(n)` hands out the next `n` slots whether or not they are due. `Skip(now, keep)` passes over due slots, keeping the newest `keep`. `NextDue()` returns the cursor slot and the first whole nanosecond at which it is due.
 - A `Span` covers slots `First` to `First+Count−1`. `Span.Time(i)` panics when `i >= Count`, as slice indexing does. `Span.All()` is an `iter.Seq2` over slots and times.
 
@@ -187,7 +191,7 @@ In the simulator, a linked pacer holds the device's queue within one unit for fi
 - The first reading after `NewFollower` or `Reset` anchors the mapping. After that, readings must not go back in local time, and remote ticks must increase; otherwise `Observe` returns `ErrOrder` and changes nothing.
 - `Observe` reports what it did with each reading: `StatusAnchored`, `StatusAccepted`, `StatusPending` (waiting in a window), `StatusRejected` (an outlier), or `StatusStepped` (enough agreeing outliers to show the other clock jumped; the mapping re-anchors and keeps its rate estimate).
 - `State(now)` is `StateLocked` after `LockCount` consecutive samples within `LockThreshold`, `StateHoldover` when no sample has been accepted for `HoldoverAfter`, and `StateAcquiring` otherwise. In holdover the mapping keeps running at the last rate estimate.
-- `Local` and `Remote` translate between remote ticks and local time. `Offset` is the estimated rate offset, `Trim` is that offset in parts per trillion for `Pacer.SetTrim`, and `Jitter` is a running RMS of recent phase errors.
+- `Local` and `Remote` translate between remote ticks and local time. `Offset` is the estimated rate offset, `Trim` is that offset rounded to parts per trillion (saturated to ±(10¹² − 1)) for `Pacer.SetTrim`, and `Jitter` is a running RMS of recent phase errors.
 - The defaults suit readings with microseconds of jitter. Readings that cross a network need a slower loop that looks at the least-delayed reading in each window:
 
 | Setting | Low jitter (the defaults) | Network |
@@ -202,15 +206,15 @@ The loop equations, and every rule above in full, are in the [specification](htt
 
 ### Limits and errors
 
-- Errors are matched with `errors.Is`: `ErrInvalidRate`, `ErrInvalidArgument` (a negative time, a zero count, a trim out of range), `ErrOverflow` (a slot index past 2⁶⁴ − 2, or a time or mapping that does not fit in a `time.Duration`), `ErrOrder` and `ErrNotAnchored`. A call that returns an error changes nothing.
+- Errors are matched with `errors.Is`: `ErrInvalidRate`, `ErrInvalidArgument` (a negative pacer time, a zero count, a trim out of range), `ErrOverflow` (a slot index past 2⁶⁴ − 2, or a time or mapping that does not fit in a `time.Duration`), `ErrOrder` and `ErrNotAnchored`. A call that returns an error changes nothing.
 - An invalid follower setting returns a `*ConfigError` naming the first bad field; use `errors.As`.
 - Pacer arithmetic is exact for every input, including 64-bit rate terms, slot numbers near 2⁶⁴ and times near the largest `time.Duration`. The follower's estimates are float64; its anchor is held as whole nanoseconds plus a fraction, so its precision does not depend on how long the program has run.
-- On an Apple M5, handing out one slot takes about 5 ns, and 64 slots with their times about 155 ns. `Due`, `Claim`, `Skip`, `NextDue`, `Span.Time` and `Observe` do not allocate.
+- On an Apple M5, handing out one slot takes about 5 ns, and 64 slots with their times about 155 ns. `Due`, `Claim`, `Skip`, `NextDue` and `Span.Time` do not allocate when the segment's reduced period numerator and denominator fit in `uint64` (including 48000/1 and 30000/1001 at ±50 ppm); other rates or trims may use an allocating exact fallback. The follower's `Observe`, `Local`, `Remote`, `Jitter`, `Trim` and `State` do not allocate.
 
 ### Concurrency
 
 - A `Pacer` or a `Follower` is not safe for concurrent use. Give each one owner, as in the pacing loop above, or guard it yourself.
-- A `Span` is an immutable value and may be shared freely.
+- A `Span` shares immutable segment timing, but its exported `First` and `Count` fields are writable. Treat an issued span as read-only when sharing it; copy the value before modifying those fields.
 
 ## How we know it's correct
 
@@ -253,6 +257,13 @@ The loop equations, and every rule above in full, are in the [specification](htt
    go test -run TestDifferential
    ```
    The test fails immediately. It shows what the pacer returned, what the reference returned, and the operations that led there. Undo the change with `git checkout pacer.go`.
+4. Measure it on your machine. `make bench` reports the cost of each call, including the same slot times computed with `big.Rat` for comparison. `cmd/pllpace` runs a real pacing loop and reports the rate it achieved and how late each wake-up ran; with `-find-max` it searches for the highest rate the loop sustains:
+   ```sh
+   make bench
+   go run ./cmd/pllpace -seconds 5
+   go run ./cmd/pllpace -find-max -seconds 2 -udp loopback
+   ```
+   With `-udp loopback`, every unit is sent as a UDP datagram to a receiver in the same process, so the result includes the cost of the send. Without it, units are discarded and the result is the pacing loop alone. Run `go run ./cmd/pllpace -h` for the other settings.
 
 ## How it compares
 
