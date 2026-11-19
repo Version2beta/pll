@@ -1,6 +1,5 @@
 // Command pllpace runs a real-time pacing loop with a pll.Pacer and reports
-// what it achieved: the rate, how far behind schedule it ran, and how late
-// each wake-up was. It hands units of a chosen size to an output: discarded by
+// offered units, writer-accepted bytes, schedule backlog and wake-up lateness. It hands units of a chosen size to an output: discarded by
 // default, or sent as UDP datagrams.
 //
 // Usage:
@@ -12,13 +11,16 @@
 // then narrows the range, and reports the highest rate it sustained.
 //
 // With -udp loopback it starts a receiver in the same process on 127.0.0.1
-// and sends to it, so the result includes the cost of each send.
+// and sends to it, so the result includes the cost of each send. A successful
+// UDP write does not acknowledge receipt; no received-unit count is measured.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"net"
 	"os"
 	"slices"
@@ -38,31 +40,127 @@ var (
 	slack     = flag.Duration("slack", 5*time.Millisecond, "with -find-max: how far behind schedule a trial may run and still pass")
 )
 
-// sink collects units and writes them in groups of per units.
-type sink struct {
-	w    io.Writer
-	buf  []byte
-	per  int
-	size int
+// options are validated before allocating payloads or opening UDP sockets.
+type options struct {
+	bps, unitBytes uint64
+	seconds        float64
+	mode, udp      string
+	perDatagram    int
+	findMax        bool
+	slack          time.Duration
 }
 
-func (s *sink) unit(u []byte) {
+const searchLimit = uint64(1_000_000_000_000)
+
+func (o options) validate() (time.Duration, error) {
+	ns := o.seconds * float64(time.Second)
+	maxInt := uint64(^uint(0) >> 1)
+	switch {
+	case o.bps == 0:
+		return 0, fmt.Errorf("-bps must be positive")
+	case o.unitBytes == 0 || o.unitBytes > math.MaxUint64/8 || o.unitBytes > maxInt:
+		return 0, fmt.Errorf("-unit-bytes must fit in int and convert to bits without overflow")
+	case math.IsNaN(ns) || math.IsInf(ns, 0) || ns < 1 || ns >= float64(math.MaxInt64):
+		return 0, fmt.Errorf("-seconds must be finite, positive and representable as a time.Duration")
+	case o.mode != "pacer" && o.mode != "ticker":
+		return 0, fmt.Errorf("-mode must be pacer or ticker")
+	case o.perDatagram < 1 || uint64(o.perDatagram) > maxInt/o.unitBytes:
+		return 0, fmt.Errorf("-per-datagram must be positive and its byte size must fit in int")
+	case o.udp != "" && uint64(o.perDatagram)*o.unitBytes > 65507:
+		return 0, fmt.Errorf("UDP payload must not exceed 65507 bytes")
+	case o.findMax && o.mode != "pacer":
+		return 0, fmt.Errorf("-find-max requires -mode pacer")
+	case o.findMax && o.bps > searchLimit:
+		return 0, fmt.Errorf("-bps must not exceed %d with -find-max", searchLimit)
+	case o.slack < 0:
+		return 0, fmt.Errorf("-slack must not be negative")
+	}
+	if o.mode == "ticker" {
+		if _, err := tickerPeriod(o.bps, o.unitBytes); err != nil {
+			return 0, err
+		}
+	}
+	return time.Duration(ns), nil
+}
+
+// tickerPeriod floors the exact period; unlike a float-to-duration conversion,
+// this also detects periods outside NewTicker's positive int64 domain.
+func tickerPeriod(bps, size uint64) (time.Duration, error) {
+	if bps == 0 || size == 0 || size > math.MaxUint64/8 {
+		return 0, fmt.Errorf("invalid ticker rate or unit size")
+	}
+	var n big.Int
+	n.SetUint64(size * 8)
+	n.Mul(&n, big.NewInt(int64(time.Second)))
+	n.Quo(&n, new(big.Int).SetUint64(bps))
+	if !n.IsInt64() || n.Sign() <= 0 {
+		return 0, fmt.Errorf("ticker period must be between 1 ns and the largest time.Duration")
+	}
+	return time.Duration(n.Int64()), nil
+}
+
+// sink groups units. Every trial flushes its final partial group; on a write
+// failure the unwritten buffer is discarded, never carried into another trial.
+type sink struct {
+	w         io.Writer
+	buf       []byte
+	per, size int
+	written   uint64 // bytes accepted by Write, not acknowledged UDP delivery
+}
+
+func (s *sink) unit(u []byte) error {
 	s.buf = append(s.buf, u...)
 	if len(s.buf) >= s.per*s.size {
-		s.w.Write(s.buf)
-		s.buf = s.buf[:0]
+		return s.flush()
 	}
+	return nil
+}
+
+func (s *sink) flush() error {
+	if len(s.buf) == 0 {
+		return nil
+	}
+	length := len(s.buf)
+	n, err := s.w.Write(s.buf)
+	s.written += uint64(n)
+	s.buf = s.buf[:0]
+	if err != nil {
+		return err
+	}
+	if n != length {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 type result struct {
-	sent, wakeups, maxBatch uint64
-	elapsed                 time.Duration
-	behind                  time.Duration   // how far behind schedule the last wake-up left the output
-	worst                   []time.Duration // per wake-up: how late its oldest unit was
+	offered, written, wakeups, maxBatch uint64 // units offered; bytes accepted by the writer
+	elapsed                             time.Duration
+	behind                              time.Duration   // how far behind schedule the output cursor is
+	worst                               []time.Duration // per wake-up: how late its oldest unit was
 }
 
 func (r result) mbps() float64 {
-	return float64(r.sent) * float64(*unitBytes) * 8 / r.elapsed.Seconds() / 1e6
+	if r.elapsed <= 0 {
+		return 0
+	}
+	return float64(r.written) * 8 / r.elapsed.Seconds() / 1e6
+}
+
+// sustained requires a nonempty trial as well as meeting both timing bounds.
+func (r result) sustained(slack time.Duration) bool {
+	return r.offered > 0 && r.behind <= slack && quantile(r.worst, 0.99) <= slack
+}
+
+// finishTrial includes the final partial write in both elapsed time and byte count.
+func finishTrial(r *result, out *sink, start time.Time, initial uint64, err *error) {
+	if *err == nil {
+		*err = out.flush()
+	}
+	out.buf = out.buf[:0]
+	r.written = out.written - initial
+	r.elapsed = time.Since(start)
+	slices.Sort(r.worst)
 }
 
 func quantile(d []time.Duration, f float64) time.Duration {
@@ -72,8 +170,7 @@ func quantile(d []time.Duration, f float64) time.Duration {
 	return d[int(f*float64(len(d)-1))]
 }
 
-func runPacer(bps uint64, dur time.Duration, out *sink, progress bool) (result, error) {
-	var r result
+func runPacer(bps uint64, dur time.Duration, out *sink, progress bool) (r result, err error) {
 	rate, err := pll.BitsPerSecond(bps, *unitBytes*8)
 	if err != nil {
 		return r, err
@@ -84,6 +181,18 @@ func runPacer(bps uint64, dur time.Duration, out *sink, progress bool) (result, 
 	}
 	u := make([]byte, *unitBytes)
 	start := time.Now()
+	initial := out.written
+	defer func() {
+		finishTrial(&r, out, start, initial, &err)
+		if err == nil {
+			_, at, nextErr := p.NextDue()
+			if nextErr != nil {
+				err = nextErr
+				return
+			}
+			r.behind = max(0, r.elapsed-at)
+		}
+	}()
 	nextReport := time.Second
 	for {
 		now := time.Since(start)
@@ -99,53 +208,72 @@ func runPacer(bps uint64, dur time.Duration, out *sink, progress bool) (result, 
 			r.worst = append(r.worst, now-span.Time(0))
 		}
 		for range span.Count {
-			out.unit(u)
+			r.offered++
+			if err := out.unit(u); err != nil {
+				return r, err
+			}
 		}
-		r.sent += span.Count
 		r.maxBatch = max(r.maxBatch, span.Count)
-		r.elapsed = now
+		r.elapsed = time.Since(start)
+		r.written = out.written - initial
 		if progress && now >= nextReport {
-			fmt.Printf("%6.1fs  %10d units  %9.3f Mbps\n", now.Seconds(), r.sent, r.mbps())
+			fmt.Printf("%6.1fs  %10d offered units  %9.3f writer Mbps\n", now.Seconds(), r.offered, r.mbps())
 			nextReport += time.Second
 		}
 		_, at, err := p.NextDue()
 		if err != nil {
 			return r, err
 		}
-		r.behind = max(0, now-at)
-		if d := at - time.Since(start); d > 0 {
+		if d := min(at-time.Since(start), dur-time.Since(start)); d > 0 {
 			time.Sleep(d)
 		}
 	}
-	slices.Sort(r.worst)
 	return r, nil
 }
 
-func runTicker(bps uint64, dur time.Duration, out *sink) result {
-	var r result
+func runTicker(bps uint64, dur time.Duration, out *sink) (r result, err error) {
+	period, err := tickerPeriod(bps, *unitBytes)
+	if err != nil {
+		return r, err
+	}
 	ups := float64(bps) / float64(*unitBytes*8)
 	u := make([]byte, *unitBytes)
-	t := time.NewTicker(time.Duration(float64(time.Second) / ups))
+	t := time.NewTicker(period)
 	defer t.Stop()
 	start := time.Now()
+	initial := out.written
+	defer func() {
+		finishTrial(&r, out, start, initial, &err)
+		// A ticker starts at one period, so the next ideal tick after n
+		// offered units is at (n+1)/ups, even if actual ticks were dropped.
+		r.behind = time.Duration(max(0, float64(r.elapsed)-float64(r.offered+1)/ups*float64(time.Second)))
+	}()
+	end := time.NewTimer(dur)
+	defer end.Stop()
 	nextReport := time.Second
-	for range t.C {
-		now := time.Since(start)
-		if now >= dur {
-			break
-		}
-		r.behind = max(0, now-time.Duration(float64(r.sent)/ups*float64(time.Second)))
-		r.wakeups++
-		out.unit(u)
-		r.sent++
-		r.maxBatch = 1
-		r.elapsed = now
-		if now >= nextReport {
-			fmt.Printf("%6.1fs  %10d units  %9.3f Mbps\n", now.Seconds(), r.sent, r.mbps())
-			nextReport += time.Second
+	for {
+		select {
+		case <-end.C:
+			return r, nil
+		case <-t.C:
+			now := time.Since(start)
+			if now >= dur {
+				return r, nil
+			}
+			r.wakeups++
+			r.offered++
+			if err := out.unit(u); err != nil {
+				return r, err
+			}
+			r.maxBatch = 1
+			r.elapsed = time.Since(start)
+			r.written = out.written - initial
+			if now >= nextReport {
+				fmt.Printf("%6.1fs  %10d offered units  %9.3f writer Mbps\n", now.Seconds(), r.offered, r.mbps())
+				nextReport += time.Second
+			}
 		}
 	}
-	return r
 }
 
 func fail(err error) {
@@ -174,8 +302,12 @@ func loopback() string {
 
 func main() {
 	flag.Parse()
-	if *unitBytes == 0 {
-		fail(fmt.Errorf("-unit-bytes must be at least 1"))
+	dur, err := (options{
+		bps: *bps, unitBytes: *unitBytes, seconds: *secs, mode: *mode,
+		udp: *udp, perDatagram: *perDgm, findMax: *findMax, slack: *slack,
+	}).validate()
+	if err != nil {
+		fail(err)
 	}
 	out := &sink{w: io.Discard, per: 1, size: int(*unitBytes)}
 	where := "discarded"
@@ -189,10 +321,9 @@ func main() {
 			fail(err)
 		}
 		defer conn.Close()
-		out = &sink{w: conn, per: max(1, *perDgm), size: int(*unitBytes)}
-		where = fmt.Sprintf("sent to %s, %d per UDP datagram", addr, out.per)
+		out = &sink{w: conn, per: *perDgm, size: int(*unitBytes)}
+		where = fmt.Sprintf("UDP writes to %s, up to %d units per datagram; receipt not measured", addr, out.per)
 	}
-	dur := time.Duration(*secs * float64(time.Second))
 
 	if *findMax {
 		maxRate(dur, out, where)
@@ -210,15 +341,14 @@ func main() {
 			fail(err)
 		}
 	case "ticker":
-		r = runTicker(*bps, dur, out)
-	default:
-		fmt.Fprintln(os.Stderr, "pllpace: -mode must be pacer or ticker")
-		os.Exit(2)
+		if r, err = runTicker(*bps, dur, out); err != nil {
+			fail(err)
+		}
 	}
-	fmt.Printf("result  %d units in %.3fs = %.3f Mbps (target %.3f), %v behind schedule at the end\n",
-		r.sent, r.elapsed.Seconds(), r.mbps(), float64(*bps)/1e6, r.behind.Round(time.Microsecond))
+	fmt.Printf("result  %d offered units, %d writer-accepted bytes in %.3fs = %.3f writer Mbps (target %.3f), %v behind schedule at the end\n",
+		r.offered, r.written, r.elapsed.Seconds(), r.mbps(), float64(*bps)/1e6, r.behind.Round(time.Microsecond))
 	fmt.Printf("        %d wake-ups, %.1f units per wake-up on average, %d at most\n",
-		r.wakeups, float64(r.sent)/float64(max(r.wakeups, 1)), r.maxBatch)
+		r.wakeups, float64(r.offered)/float64(max(r.wakeups, 1)), r.maxBatch)
 	if len(r.worst) > 0 {
 		fmt.Printf("        oldest unit at each wake-up, lateness: median %v, 99th %v, max %v\n",
 			quantile(r.worst, 0.5).Round(time.Microsecond), quantile(r.worst, 0.99).Round(time.Microsecond),
@@ -232,14 +362,14 @@ func main() {
 func maxRate(dur time.Duration, out *sink, where string) {
 	fmt.Printf("searching for the highest sustained rate: %d-byte units, %v per trial, pass if within %v of schedule (%s)\n",
 		*unitBytes, dur, *slack, where)
-	fmt.Printf("%14s  %12s  %12s  %12s  %10s  %s\n", "target Mbps", "units/s", "achieved", "behind (ms)", "late p99", "")
+	fmt.Printf("%14s  %12s  %12s  %12s  %10s  %s\n", "target Mbps", "units/s", "writer Mbps", "behind (ms)", "late p99", "")
 	trial := func(bps uint64) bool {
 		r, err := runPacer(bps, dur, out, false)
 		if err != nil {
 			fail(err)
 		}
 		p99 := quantile(r.worst, 0.99)
-		ok := r.behind <= *slack && p99 <= *slack
+		ok := r.sustained(*slack)
 		verdict := "pass"
 		if !ok {
 			verdict = "FAIL"
@@ -250,7 +380,7 @@ func maxRate(dur time.Duration, out *sink, where string) {
 		return ok
 	}
 	lo, hi := uint64(0), uint64(0)
-	for b := *bps; b <= 1_000_000_000_000; b *= 2 {
+	for b := *bps; b <= searchLimit; b *= 2 {
 		if !trial(b) {
 			hi = b
 			break

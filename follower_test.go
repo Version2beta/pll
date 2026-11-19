@@ -3,6 +3,7 @@ package pll_test
 import (
 	"errors"
 	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -549,5 +550,378 @@ func TestFollowerLongRun(t *testing.T) {
 		}
 		wantLocal(t, f, r, truth(r), 2)
 		wantLocal(t, f, r+1, truth(r+1), 2)
+	}
+}
+
+// An overflowing non-outlier must not erase a preceding outlier run, nor
+// consume reading order or a pending window candidate.
+func TestFollowerOverflowPreservesOutlierRun(t *testing.T) {
+	for _, window := range []time.Duration{0, 2 * time.Nanosecond} {
+		t.Run(window.String(), func(t *testing.T) {
+			cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+			cfg.StepAfter, cfg.Window = 2, window
+			control, failed := mustFollower(t, cfg), mustFollower(t, cfg)
+			const end = time.Duration(math.MaxInt64)
+			for _, f := range []*pll.Follower{control, failed} {
+				observe(t, f, end-time.Second, 0, pll.StatusAnchored)
+				if window == 0 {
+					observe(t, f, end-time.Second+1, 1_000_000_001, pll.StatusRejected)
+				} else {
+					observe(t, f, end-time.Second+1, 1_000_000_001, pll.StatusPending)
+					observe(t, f, end-2, 1_000_000_010, pll.StatusRejected)
+				}
+			}
+			if _, err := failed.Observe(end, 1_000_000_011); !errors.Is(err, pll.ErrOverflow) {
+				t.Fatalf("overflowing Observe: %v", err)
+			}
+			for _, f := range []*pll.Follower{control, failed} {
+				if window > 0 {
+					observe(t, f, end-1, 2_000_000_001, pll.StatusPending)
+					observe(t, f, end, 2_000_000_002, pll.StatusStepped)
+				} else {
+					observe(t, f, end, 2_000_000_001, pll.StatusStepped)
+				}
+			}
+			for _, remote := range []int64{0, 1_000_000_000, 2_000_000_001} {
+				a, ae := control.Local(remote)
+				b, be := failed.Local(remote)
+				if a != b || ae != be {
+					t.Fatalf("continuation Local(%d): (%v, %v) != (%v, %v)", remote, a, ae, b, be)
+				}
+			}
+			if control.Offset() != failed.Offset() || control.Trim() != failed.Trim() ||
+				control.Jitter() != failed.Jitter() || control.State(end) != failed.State(end) {
+				t.Fatal("overflow changed continuation state")
+			}
+		})
+	}
+}
+
+func TestFollowerExtremeFiniteGains(t *testing.T) {
+	for _, bandwidth := range []float64{math.SmallestNonzeroFloat64, 1e-300, 0.1, math.MaxFloat64} {
+		for _, damping := range []float64{math.SmallestNonzeroFloat64, math.Sqrt2 / 2, math.MaxFloat64} {
+			for _, phase := range []time.Duration{0, 100, -100} {
+				cfg := perfect(t)
+				cfg.Bandwidth, cfg.Damping = bandwidth, damping
+				f := mustFollower(t, cfg)
+				observe(t, f, 0, 0, pll.StatusAnchored)
+				l := time.Second + phase
+				obs := observe(t, f, l, 1000, pll.StatusAccepted)
+				if obs.Error != phase || math.IsNaN(f.Offset()) || math.IsInf(f.Offset(), 0) || math.Abs(f.Offset()) > cfg.MaxOffsetPPM*1e-6 {
+					t.Fatalf("bandwidth %g damping %g phase %v: observation %+v offset %g", bandwidth, damping, phase, obs, f.Offset())
+				}
+				// Evaluate capped gains with high precision so intermediate
+				// float overflow/underflow cannot repeat the production bug.
+				x := new(big.Float).SetPrec(256).SetFloat64(2 * math.Pi)
+				x.Mul(x, new(big.Float).SetFloat64(bandwidth))
+				x.Mul(x, new(big.Float).SetFloat64(l.Seconds()))
+				if x.Cmp(big.NewFloat(0.5)) > 0 {
+					x.SetFloat64(0.5)
+				}
+				kp := new(big.Float).SetPrec(256).SetFloat64(damping)
+				kp.Mul(kp, x).Mul(kp, big.NewFloat(2))
+				if kp.Cmp(big.NewFloat(1)) > 0 {
+					kp.SetFloat64(1)
+				}
+				gain, _ := kp.Float64()
+				wantLocal(t, f, 1000, time.Second+time.Duration(math.Round(gain*float64(phase))), 1)
+				wantY, _ := new(big.Float).Quo(new(big.Float).Mul(x, x), new(big.Float).SetFloat64(l.Seconds())).Float64()
+				wantY *= -float64(phase) / 1e9
+				if math.Abs(f.Offset()-wantY) > 1e-20 {
+					t.Fatalf("bandwidth %g damping %g: Offset %g, want %g", bandwidth, damping, f.Offset(), wantY)
+				}
+			}
+		}
+	}
+}
+
+func TestFollowerTrimSaturatesForPacer(t *testing.T) {
+	for _, sign := range []int64{-1, 1} {
+		cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+		cfg.MaxOffsetPPM = math.Nextafter(1e6, 0)
+		cfg.Bandwidth, cfg.Damping = 1e9, 1e-300
+		cfg.OutlierThreshold = time.Hour
+		f := mustFollower(t, cfg)
+		observe(t, f, 0, 0, pll.StatusAnchored)
+		if sign > 0 {
+			observe(t, f, 1, 1_000_000_000, pll.StatusAccepted)
+		} else {
+			observe(t, f, time.Second, 1, pll.StatusAccepted)
+			observe(t, f, time.Second+1, 2, pll.StatusAccepted)
+		}
+		if f.Offset() != float64(sign)*cfg.MaxOffsetPPM*1e-6 {
+			t.Fatalf("setup Offset = %g, want clamp with sign %d", f.Offset(), sign)
+		}
+		if want := sign * 999_999_999_999; f.Trim() != want {
+			t.Fatalf("Trim = %d, want %d", f.Trim(), want)
+		}
+		p := mustPacer(t, 1_000_000_000, 1)
+		if err := p.SetTrim(f.Trim()); err != nil {
+			t.Fatalf("SetTrim(Trim()) = %v", err)
+		}
+	}
+}
+
+// At period 1 ns, these remote differences are exactly representable as
+// float64, including displacements beyond int64. The independent integer
+// oracle preserves every low bit of the base and checks the final sum only.
+func TestFollowerMappingWideDisplacements(t *testing.T) {
+	bases := []int64{math.MinInt64, math.MinInt64 + 1, -4097, -4096, -1, 0, 1, 4095, 4096, 4097, math.MaxInt64 - 1, math.MaxInt64}
+	pairs := [][2]int64{
+		{0, -1}, {0, 1},
+		{math.MinInt64, -4096}, {math.MinInt64, 0}, {math.MinInt64, 4096}, {math.MinInt64, math.MaxInt64 - 4095},
+		{math.MaxInt64 - 2047, -2048}, {math.MaxInt64 - 2047, -6144}, {math.MaxInt64 - 2047, math.MinInt64 + 2048},
+	}
+	cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+	for _, base := range bases {
+		for _, pair := range pairs {
+			from, to := pair[0], pair[1]
+			want := new(big.Int).Sub(big.NewInt(to), big.NewInt(from))
+			want.Add(want, big.NewInt(base))
+			f := mustFollower(t, cfg)
+			observe(t, f, time.Duration(base), from, pll.StatusAnchored)
+			got, err := f.Local(to)
+			g := mustFollower(t, cfg)
+			observe(t, g, time.Duration(from), base, pll.StatusAnchored)
+			remote, remoteErr := g.Remote(time.Duration(to))
+			for _, result := range []struct {
+				value int64
+				err   error
+			}{{int64(got), err}, {remote, remoteErr}} {
+				if want.IsInt64() {
+					if result.err != nil || result.value != want.Int64() {
+						t.Fatalf("base %d + (%d - %d) = (%d, %v), want %v", base, to, from, result.value, result.err, want)
+					}
+				} else if result.value != 0 || !errors.Is(result.err, pll.ErrOverflow) {
+					t.Fatalf("base %d + (%d - %d) = (%d, %v), want overflow", base, to, from, result.value, result.err)
+				}
+			}
+		}
+	}
+	f := mustFollower(t, cfg)
+	observe(t, f, math.MinInt64, math.MinInt64, pll.StatusAnchored)
+	observe(t, f, 0, 0, pll.StatusAccepted)
+	wantLocal(t, f, 1, 1, 0)
+	if allocs := testing.AllocsPerRun(100, func() {
+		f.Local(math.MinInt64)
+		f.Remote(math.MinInt64)
+	}); allocs != 0 {
+		t.Fatalf("wide mappings: %g allocations", allocs)
+	}
+}
+
+func TestFollowerMappingNegativeFractionsAndTies(t *testing.T) {
+	for _, base := range []int64{-1<<60 + 7, -1, 0, 1, 1<<60 + 7} {
+		for _, delta := range []int64{-3, -2, -1, 0, 1, 2, 3} {
+			cfg := pll.DefaultFollowerConfig(mustRate(t, 2_000_000_000, 1))
+			f := mustFollower(t, cfg)
+			observe(t, f, time.Duration(base), 0, pll.StatusAnchored)
+			want := base + int64(math.Round(float64(delta)/2))
+			wantLocal(t, f, delta, time.Duration(want), 0)
+			cfg.Nominal = mustRate(t, 500_000_000, 1)
+			g := mustFollower(t, cfg)
+			observe(t, g, 0, base, pll.StatusAnchored)
+			if got, err := g.Remote(time.Duration(delta)); err != nil || got != want {
+				t.Fatalf("Remote(%d), base %d = (%d, %v), want %d", delta, base, got, err, want)
+			}
+		}
+	}
+}
+
+func TestFollowerWindowBoundaries(t *testing.T) {
+	for _, base := range []time.Duration{math.MinInt64, 0, math.MaxInt64 - 5} {
+		cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+		cfg.Window = 4
+		f := mustFollower(t, cfg)
+		observe(t, f, base, 0, pll.StatusAnchored)
+		observe(t, f, base+1, 1, pll.StatusPending)
+		// Equal phase errors keep the earlier candidate (strict minimum).
+		obs := observe(t, f, base+4, 4, pll.StatusPending)
+		if obs.Error != 0 {
+			t.Fatal("pending Error is not zero")
+		}
+		observe(t, f, base+5, 5, pll.StatusAccepted) // exactly start+Window
+		// The accepted candidate was at base+1, not base+4 or the
+		// boundary reading at base+5. Holdover measures candidate time.
+		if base < 0 && f.State(base+1+cfg.HoldoverAfter) == pll.StateHoldover {
+			t.Fatal("holdover at exact threshold")
+		}
+		if base <= math.MaxInt64-cfg.HoldoverAfter-2 && f.State(base+2+cfg.HoldoverAfter) != pll.StateHoldover {
+			t.Fatal("window did not keep the first equal-error candidate")
+		}
+		// The new window extends beyond MaxInt64 in the last case.
+		if base > 0 {
+			observe(t, f, base+5, 6, pll.StatusPending)
+		}
+	}
+}
+
+func TestFollowerOrderIncludesPendingAndRejected(t *testing.T) {
+	for _, window := range []time.Duration{0, time.Second} {
+		cfg := perfect(t)
+		cfg.Window = window
+		f := mustFollower(t, cfg)
+		observe(t, f, 0, 0, pll.StatusAnchored)
+		status := pll.StatusRejected
+		if window > 0 {
+			status = pll.StatusPending
+		}
+		observe(t, f, 10*ms, 1000, status)
+		for _, rd := range [][2]int64{{int64(10*ms - 1), 1001}, {int64(10 * ms), 1000}} {
+			obs, err := f.Observe(time.Duration(rd[0]), rd[1])
+			if !errors.Is(err, pll.ErrOrder) || obs != (pll.Observation{}) {
+				t.Fatalf("Observe(%v) = (%+v, %v), want zero and ErrOrder", rd, obs, err)
+			}
+		}
+		// Failed readings consumed neither order coordinate nor the run.
+		observe(t, f, 10*ms, 1001, status)
+		wantLocal(t, f, 0, 0, 0)
+	}
+}
+
+func TestFollowerOutlierThresholdAndRunReference(t *testing.T) {
+	cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+	cfg.OutlierThreshold, cfg.LockThreshold, cfg.LockCount = 2, 2, 1
+	f := mustFollower(t, cfg)
+	observe(t, f, 0, 0, pll.StatusAnchored)
+	observe(t, f, 0, 2, pll.StatusAccepted) // equality is not an outlier; dt=0
+	if f.State(0) != pll.StateLocked {
+		t.Fatal("LockThreshold equality must count toward lock")
+	}
+	observe(t, f, 0, 3, pll.StatusRejected) // e=-3
+	observe(t, f, 1, 6, pll.StatusRejected) // e=-5: exactly threshold from first
+	observe(t, f, 2, 9, pll.StatusRejected) // e=-7: near last, but not first
+	observe(t, f, 3, 10, pll.StatusRejected)
+	observe(t, f, 4, 11, pll.StatusStepped)
+	wantLocal(t, f, 11, 4, 0)
+}
+
+func TestFollowerResetClearsPendingAndOutlierState(t *testing.T) {
+	for _, window := range []time.Duration{0, 2 * time.Nanosecond} {
+		cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+		cfg.Window, cfg.StepAfter = window, 2
+		f := mustFollower(t, cfg)
+		observe(t, f, 100, 100, pll.StatusAnchored)
+		if window > 0 {
+			observe(t, f, 101, 1_000_000_000, pll.StatusPending)
+			observe(t, f, 103, 1_000_000_001, pll.StatusRejected)
+		} else {
+			observe(t, f, 101, 1_000_000_000, pll.StatusRejected)
+		}
+		f.Reset()
+		fresh := mustFollower(t, cfg)
+		for _, rd := range [][2]int64{{-100, -100}, {-99, 1_000_000_000}, {-97, 1_000_000_001}, {-95, 1_000_000_002}} {
+			a, ae := f.Observe(time.Duration(rd[0]), rd[1])
+			b, be := fresh.Observe(time.Duration(rd[0]), rd[1])
+			if a != b || ae != be || f.Offset() != fresh.Offset() || f.Jitter() != fresh.Jitter() || f.State(time.Duration(rd[0])) != fresh.State(time.Duration(rd[0])) {
+				t.Fatalf("reset differs from fresh follower at %v: (%+v,%v) vs (%+v,%v)", rd, a, ae, b, be)
+			}
+		}
+	}
+}
+
+func TestFollowerConfigNonfiniteAndValidationOrder(t *testing.T) {
+	for _, field := range []string{"Bandwidth", "Damping", "MaxOffsetPPM"} {
+		for _, value := range []float64{0, -1, math.NaN(), math.Inf(-1), math.Inf(1)} {
+			cfg := perfect(t)
+			switch field {
+			case "Bandwidth":
+				cfg.Bandwidth = value
+			case "Damping":
+				cfg.Damping = value
+			case "MaxOffsetPPM":
+				cfg.MaxOffsetPPM = value
+			}
+			f, err := pll.NewFollower(cfg)
+			var ce *pll.ConfigError
+			if f != nil || !errors.As(err, &ce) || ce.Field != field {
+				t.Fatalf("%s=%g: NewFollower = (%v, %v)", field, value, f, err)
+			}
+		}
+	}
+	good := perfect(t)
+	bad := pll.FollowerConfig{Window: -1, LockThreshold: -1}
+	for _, field := range []string{"Nominal", "Bandwidth", "Damping", "MaxOffsetPPM", "Window", "OutlierThreshold", "StepAfter", "LockThreshold", "LockCount", "HoldoverAfter"} {
+		f, err := pll.NewFollower(bad)
+		var ce *pll.ConfigError
+		if f != nil || !errors.As(err, &ce) || ce.Field != field {
+			t.Fatalf("first remaining invalid field %s: (%v, %v)", field, f, err)
+		}
+		switch field {
+		case "Nominal":
+			bad.Nominal = good.Nominal
+		case "Bandwidth":
+			bad.Bandwidth = good.Bandwidth
+		case "Damping":
+			bad.Damping = good.Damping
+		case "MaxOffsetPPM":
+			bad.MaxOffsetPPM = good.MaxOffsetPPM
+		case "Window":
+			bad.Window = good.Window
+		case "OutlierThreshold":
+			bad.OutlierThreshold = good.OutlierThreshold
+		case "StepAfter":
+			bad.StepAfter = good.StepAfter
+		case "LockThreshold":
+			bad.LockThreshold = good.LockThreshold
+		case "LockCount":
+			bad.LockCount = good.LockCount
+		case "HoldoverAfter":
+			bad.HoldoverAfter = good.HoldoverAfter
+		}
+	}
+	mustFollower(t, bad)
+}
+
+func TestFollowerObservationErrorSaturates(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		num, den            uint64
+		anchor, local, want time.Duration
+	}{
+		{"positive", 1_000_000_000, 1, math.MinInt64, math.MaxInt64, math.MaxInt64},
+		// One tick of this clock exceeds the entire Duration range.
+		{"negative", 1, math.MaxUint64, 0, 0, math.MinInt64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := mustFollower(t, pll.DefaultFollowerConfig(mustRate(t, tc.num, tc.den)))
+			observe(t, f, tc.anchor, 0, pll.StatusAnchored)
+			obs := observe(t, f, tc.local, 1, pll.StatusRejected)
+			if obs.Error != tc.want {
+				t.Fatalf("Error = %v, want saturated %v", obs.Error, tc.want)
+			}
+		})
+	}
+}
+
+func TestFollowerWideUpdateOverflowIsAtomic(t *testing.T) {
+	cfg := pll.DefaultFollowerConfig(mustRate(t, 1_000_000_000, 1))
+	control, failed := mustFollower(t, cfg), mustFollower(t, cfg)
+	for _, f := range []*pll.Follower{control, failed} {
+		observe(t, f, -4096, math.MinInt64, pll.StatusAnchored)
+	}
+	// The rounded displacement is 2^63+4096, placing the new anchor
+	// exactly one nanosecond beyond MaxInt64. Neither ordering coordinate
+	// may be committed, so an earlier/lower valid retry must still work.
+	obs, err := failed.Observe(math.MaxInt64, 4096)
+	if !errors.Is(err, pll.ErrOverflow) || obs != (pll.Observation{}) {
+		t.Fatalf("overflowing update = (%+v, %v)", obs, err)
+	}
+	for _, f := range []*pll.Follower{control, failed} {
+		observe(t, f, math.MaxInt64-4095, 0, pll.StatusAccepted)
+		wantLocal(t, f, 0, math.MaxInt64-4095, 0)
+	}
+	if control.Offset() != failed.Offset() || control.Jitter() != failed.Jitter() || control.State(math.MaxInt64) != failed.State(math.MaxInt64) {
+		t.Fatal("overflow changed continuation state")
+	}
+}
+
+func TestFollowerHoldoverAcrossSignedRange(t *testing.T) {
+	cfg := perfect(t)
+	cfg.HoldoverAfter = math.MaxInt64
+	f := mustFollower(t, cfg)
+	observe(t, f, math.MinInt64, 0, pll.StatusAnchored)
+	if f.State(-1) != pll.StateAcquiring || f.State(0) != pll.StateHoldover || f.State(math.MaxInt64) != pll.StateHoldover {
+		t.Fatal("holdover must compare the elapsed interval without signed overflow")
 	}
 }

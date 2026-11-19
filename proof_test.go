@@ -288,3 +288,15 @@ func TestAllocs(t *testing.T) {
 }
 
 var _ = pll.ErrOverflow
+
+func TestPacerWideReducedPeriod(t *testing.T) {
+	// Both rate terms fit in 32 bits, but a 50 ppm trim makes the reduced
+	// period too wide for the allocation-free path. Exactness still holds.
+	for _, trim := range []int64{50_000_000, -50_000_000} {
+		runOps(t, 4_294_967_295, 4_294_967_291, []op{
+			{kind: opSetTrim, trim: trim}, {kind: opClaim, n: 1},
+			{kind: opNextDue}, {kind: opDue, now: 10_000_000_000, n: 4},
+			{kind: opSkip, now: 20_000_000_000, n: 2}, {kind: opClaim, n: 3},
+		})
+	}
+}

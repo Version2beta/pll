@@ -222,10 +222,10 @@ func (f *Follower) feed(l time.Duration, r int64) (Observation, error) {
 		}
 		return obs, nil
 	}
-	f.runLen = 0
 	if err := f.accept(l, r, e); err != nil {
 		return Observation{}, err
 	}
+	f.runLen = 0
 	obs.Status = StatusAccepted
 	return obs, nil
 }
@@ -237,17 +237,20 @@ func (f *Follower) accept(l time.Duration, r int64, e float64) error {
 	y, l0, frac, r0, ref := f.y, f.l0, f.l0frac, f.r0, f.ref
 	if dt := nanosBetween(l, f.ref) / 1e9; dt > 0 {
 		wn := f.wn
-		x := wn * math.Min(dt, 1/(2*wn))
-		kp := math.Min(1, 2*f.cfg.Damping*x)
+		// Cap the product, not dt: wn may overflow for a valid finite
+		// Bandwidth, and multiplying Inf by a zero capped dt gives NaN.
+		x := math.Min(0.5, wn*dt)
+		kp := math.Min(1, 2*(f.cfg.Damping*x))
 		pred := f.predictFrom(r) // L̂_old(r) − L0, before y changes
 		maxY := f.cfg.MaxOffsetPPM * 1e-6
 		y = min(max(f.y-(x*x/dt)*e/1e9, -maxY), maxY)
 		v := pred + kp*e
 		ns := math.Round(v)
-		var err error
-		if l0, err = addNanos(f.l0, ns); err != nil {
+		anchor, err := addWhole(int64(f.l0), ns)
+		if err != nil {
 			return err
 		}
+		l0 = time.Duration(anchor)
 		frac = v - ns
 		r0, ref = r, l
 	}
@@ -306,7 +309,9 @@ func roundDuration(ns float64) time.Duration {
 	return time.Duration(r)
 }
 
-// Local maps remote ticks to local time, rounded to the nearest nanosecond.
+// Local maps remote ticks to local time. It rounds the displacement from the
+// integer local anchor to the nearest nanosecond, ties away from zero, then
+// adds the anchor without rounding it.
 func (f *Follower) Local(remote int64) (time.Duration, error) {
 	if !f.anchored {
 		return 0, ErrNotAnchored
@@ -320,10 +325,13 @@ func (f *Follower) Local(remote int64) (time.Duration, error) {
 		ticks = float64(remote) - float64(f.r0)
 	}
 	ns := math.Round(ticks*f.pn/(1+f.y) + f.l0frac)
-	return addNanos(f.l0, ns)
+	local, err := addWhole(int64(f.l0), ns)
+	return time.Duration(local), err
 }
 
-// Remote maps local time to remote ticks, rounded to the nearest tick.
+// Remote maps local time to remote ticks. It rounds the displacement from
+// the remote anchor to the nearest tick, ties away from zero, then adds the
+// anchor without rounding it.
 func (f *Follower) Remote(local time.Duration) (int64, error) {
 	if !f.anchored {
 		return 0, ErrNotAnchored
@@ -335,14 +343,7 @@ func (f *Follower) Remote(local time.Duration) (int64, error) {
 		ns = float64(local) - float64(f.l0)
 	}
 	ticks := math.Round((ns - f.l0frac) * (1 + f.y) / f.pn)
-	if !(ticks >= -(1<<63) && ticks < 1<<63) {
-		return 0, ErrOverflow
-	}
-	r, ok := addInt64(f.r0, int64(ticks))
-	if !ok {
-		return 0, ErrOverflow
-	}
-	return r, nil
+	return addWhole(f.r0, ticks)
 }
 
 // subInt64 returns a - b and whether it fits in int64.
@@ -363,25 +364,36 @@ func addInt64(a, b int64) (int64, bool) {
 	return s, true
 }
 
-// addNanos returns base + ns, where ns is a whole number of nanoseconds, or
-// ErrOverflow when the sum or ns does not fit in a time.Duration.
-func addNanos(base time.Duration, ns float64) (time.Duration, error) {
-	if !(ns >= -(1<<63) && ns < 1<<63) {
-		return 0, ErrOverflow
+// addWhole adds an already-rounded float64 integer to base without rounding
+// base's low bits. A displacement can exceed int64 while the final sum fits.
+func addWhole(base int64, whole float64) (int64, error) {
+	if whole >= -(1<<63) && whole < 1<<63 {
+		if sum, ok := addInt64(base, int64(whole)); ok {
+			return sum, nil
+		}
+	} else if whole >= 1<<63 && whole < 1<<64 && base < 0 {
+		n := uint64(whole)
+		if n <= uint64(math.MaxInt64)-uint64(base) {
+			return int64(uint64(base) + n), nil
+		}
+	} else if whole < -(1<<63) && whole > -(1<<64) && base > 0 {
+		n := uint64(-whole)
+		if n <= uint64(base)+(1<<63) {
+			return int64(uint64(base) - n), nil
+		}
 	}
-	s, ok := addInt64(int64(base), int64(ns))
-	if !ok {
-		return 0, ErrOverflow
-	}
-	return time.Duration(s), nil
+	return 0, ErrOverflow
 }
 
 // Offset returns the estimated fractional rate offset y: the remote clock
 // runs at nominal × (1 + y) as measured by the local clock.
 func (f *Follower) Offset() float64 { return f.y }
 
-// Trim returns round(y × 1e12), ready for Pacer.SetTrim.
-func (f *Follower) Trim() int64 { return int64(math.Round(f.y * 1e12)) }
+// Trim returns round(y × 1e12), saturated to ±(1e12−1) so that rounding
+// near the offset limits still gives a valid argument for Pacer.SetTrim.
+func (f *Follower) Trim() int64 {
+	return min(max(int64(math.Round(f.y*1e12)), -999_999_999_999), 999_999_999_999)
+}
 
 // Jitter returns the root mean square of accepted samples' phase errors,
 // weighted 1/16 per sample, rounded to the nearest nanosecond. It is 0 until
@@ -420,5 +432,5 @@ func (f *Follower) Reset() {
 // Observation reports what Observe did with a reading.
 type Observation struct {
 	Status Status
-	Error  time.Duration // phase error of the sample fed to the loop, ns
+	Error  time.Duration // phase error of the sample fed to the loop, rounded and saturated to time.Duration
 }

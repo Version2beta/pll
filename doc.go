@@ -18,5 +18,7 @@
 //
 // The package never reads a clock, starts a goroutine or touches your data.
 // Every call that depends on the present takes a time you pass in, a duration
-// from an origin you choose, and the hot paths allocate nothing.
+// from an origin you choose. Follower hot paths allocate nothing. Pacer hot
+// paths avoid allocations when the segment's reduced period numerator and
+// denominator fit in uint64; other rates or trims use an exact allocating fallback.
 package pll

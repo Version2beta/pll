@@ -354,3 +354,78 @@ func TestOverflow(t *testing.T) {
 	s, err = r.Due(0, 1)
 	wantSpan(t, "Due(0, 1) when slot MaxUint64 is not yet due", s, err, math.MaxUint64, 0)
 }
+
+func TestDueEarlierTimeWithBacklog(t *testing.T) {
+	p := mustPacer(t, 1000, 1)
+	s, err := p.Due(10*ms, 1)
+	wantSpan(t, "capped Due(10ms)", s, err, 0, 1)
+	s, err = p.Due(5*ms, 100)
+	wantSpan(t, "earlier Due(5ms) drains only its due backlog", s, err, 1, 5)
+	s, err = p.Due(4*ms, 100)
+	wantSpan(t, "earlier Due(4ms) never rewinds", s, err, 6, 0)
+	wantNext(t, p, 6, 6*ms)
+}
+
+func TestPacerFloorFitsButCeilingOverflows(t *testing.T) {
+	// The exact period is MaxInt64 + 1/2 ns: the floored slot time fits,
+	// but the slot can never become due within a time.Duration.
+	p := mustPacer(t, 2_000_000_000, math.MaxUint64)
+	p.Claim(1)
+	slot, at, err := p.NextDue()
+	if !errors.Is(err, pll.ErrOverflow) || slot != 0 || at != 0 {
+		t.Fatalf("NextDue = (%d, %v, %v), want zero outputs and overflow", slot, at, err)
+	}
+	s, err := p.Due(math.MaxInt64, 1)
+	wantSpan(t, "fractional slot beyond MaxInt64 not due", s, err, 1, 0)
+	s, err = p.Claim(1)
+	wantSpan(t, "Claim checks the floor", s, err, 1, 1)
+	wantTimes(t, "last floored time fits", s, []time.Duration{math.MaxInt64})
+	wantErr(t, "changed trim cannot anchor at overflowing cursor", p.SetTrim(1), pll.ErrOverflow)
+	if err := p.SetTrim(0); err != nil {
+		t.Fatalf("unchanged trim must be a no-op even at an overflowing cursor: %v", err)
+	}
+	if p.Trim() != 0 || s.Time(0) != math.MaxInt64 {
+		t.Fatal("failed/no-op trim changed state or issued span")
+	}
+}
+
+func TestSpanSharedWhilePacerChangesTrim(t *testing.T) {
+	for _, rate := range [][2]uint64{{30000, 1001}, {math.MaxUint64, math.MaxUint64 - 1}} {
+		p := mustPacer(t, rate[0], rate[1])
+		s, err := p.Claim(8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var times [8]time.Duration
+		for i := range times {
+			times[i] = s.Time(uint64(i))
+		}
+		done := make(chan bool, 1)
+		go func() {
+			for range 100 {
+				for i, want := range times {
+					if s.Time(uint64(i)) != want {
+						done <- false
+						return
+					}
+				}
+			}
+			done <- true
+		}()
+		for i := range 100 {
+			trim := int64(50_000_000)
+			if i%2 != 0 {
+				trim = -trim
+			}
+			if err := p.SetTrim(trim); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.Claim(1); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !<-done {
+			t.Fatal("shared span timing changed")
+		}
+	}
+}
