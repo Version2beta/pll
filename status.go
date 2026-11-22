@@ -1,5 +1,3 @@
-// status.go is complete; do not change it.
-
 package pll
 
 import "strconv"

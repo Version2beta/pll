@@ -260,13 +260,14 @@ For a sample `(l, r)` with phase error `e`:
 2. **Loop update.** Let `Δt` be the local seconds from the last anchor, step
    or loop update to `l`. If `Δt > 0`, with `ωn = 2π × Bandwidth`:
 
-        x  = ωn × min(Δt, 1/(2 ωn))
+        x  = min(0.5, ωn × Δt)
         kp = min(1, 2 × Damping × x)
         y  ← clamp(y − (x² / Δt) × e / 10^9,  ±MaxOffsetPPM × 10^−6)
         L0 ← L̂_old(r) + kp × e,   R0 ← r
 
-   computing `L̂_old(r)` before changing `y`. Capping `Δt` at `1/(2 ωn)`
-   keeps the loop stable however sparse the samples; for `Δt ≤ 1/(2 ωn)` these
+   computing `L̂_old(r)` before changing `y`. Capping the product at 0.5
+   keeps the loop stable however sparse the samples, even if `2π × Bandwidth`
+   overflows float64 for an extreme finite bandwidth; for `Δt ≤ 1/(2 ωn)` these
    are the plain equations `kp = 2ζ ωn Δt`, `Δy = −ωn² Δt e`. If `Δt == 0`,
    the loop does not change.
 3. **Lock.** If `|e| ≤ LockThreshold`, add 1 to the lock run (stopping at

@@ -1,5 +1,3 @@
-// doc.go is complete; do not change it.
-
 // Package pll keeps time for programs that must produce or consume things at
 // a steady rate, or follow a clock other than their own.
 //

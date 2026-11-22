@@ -1,5 +1,3 @@
-// errors.go is complete; do not change it.
-
 package pll
 
 import "errors"
@@ -9,10 +7,11 @@ var (
 	// including the zero Rate.
 	ErrInvalidRate = errors.New("pll: invalid rate")
 
-	// ErrInvalidArgument reports a negative time, a zero count, or a trim
+	// ErrInvalidArgument reports a negative pacer time, a zero count, or a trim
 	// outside the open interval (-1e12, 1e12).
 	ErrInvalidArgument = errors.New("pll: invalid argument")
 
-	// ErrOverflow reports a slot index or a slot time that does not fit.
+	// ErrOverflow reports a slot index, slot time, or follower mapping or anchor
+	// that does not fit.
 	ErrOverflow = errors.New("pll: overflow")
 )

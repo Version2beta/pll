@@ -108,7 +108,7 @@ go run ./cmd/pllpace -find-max -seconds 2 -udp loopback
 
 ## Plant a bug yourself
 
-The best way to trust a test suite is to break the code and watch it fail. Make one of these changes, run `go test .`, see which tests catch it, then undo it with `git checkout -- .`.
+The best way to trust a test suite is to break the code and watch it fail. Make one of these changes, run `go test .`, see which tests catch it, then undo only that experimental edit. Start from a clean worktree so unrelated changes are not lost.
 
 | File | Change | Caught by |
 | --- | --- | --- |
@@ -116,7 +116,7 @@ The best way to trust a test suite is to break the code and watch it fail. Make 
 | `pacer.go`, in `Due` | `if n > max {` → `if n > max+1 {` and `n = max` → `n = max + 1` | `TestDueLimits`, `TestOverflow`, `TestBoundaries`, `TestDifferential`, `FuzzPacer`, and more |
 | `pacer.go`, in `SetTrim` | delete the early return when the trim is unchanged | `TestSetTrim`, `TestDifferential` |
 | `follower.go`, in `accept` | `f.y-(x*x/dt)*e/1e9` → `f.y+(x*x/dt)*e/1e9` (positive feedback) | Eleven tests, including `TestLoopEquations` and `TestScenarios` |
-| `follower.go`, in `accept` | `x := wn * math.Min(dt, 1/(2*wn))` → `x := wn * dt` (no gain cap) | `TestLoopEquations`, `TestFollowerDifferential`, `TestFollowerLongRun`, `TestScenarios` |
+| `follower.go`, in `accept` | `x := math.Min(0.5, wn*dt)` → `x := wn * dt` (no gain cap) | `TestLoopEquations`, `TestFollowerDifferential`, `TestFollowerLongRun`, `TestScenarios` |
 | `follower.go`, in `Observe` | `e < f.candErr` → `e > f.candErr` (keep the most delayed reading) | `TestWindow`, `TestScenarios` |
 
 If you find a change that no test catches, that is a missing test. Please open an issue.
