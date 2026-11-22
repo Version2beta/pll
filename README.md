@@ -209,7 +209,7 @@ The loop equations, and every rule above in full, are in the [specification](htt
 - Errors are matched with `errors.Is`: `ErrInvalidRate`, `ErrInvalidArgument` (a negative pacer time, a zero count, a trim out of range), `ErrOverflow` (a slot index past 2⁶⁴ − 2, or a time or mapping that does not fit in a `time.Duration`), `ErrOrder` and `ErrNotAnchored`. A call that returns an error changes nothing.
 - An invalid follower setting returns a `*ConfigError` naming the first bad field; use `errors.As`.
 - Pacer arithmetic is exact for every input, including 64-bit rate terms, slot numbers near 2⁶⁴ and times near the largest `time.Duration`. The follower's estimates are float64; its anchor is held as whole nanoseconds plus a fraction, so its precision does not depend on how long the program has run.
-- On an Apple M5, handing out one slot takes about 5 ns, and 64 slots with their times about 155 ns. `Due`, `Claim`, `Skip`, `NextDue` and `Span.Time` do not allocate when the segment's reduced period numerator and denominator fit in `uint64` (including 48000/1 and 30000/1001 at ±50 ppm); other rates or trims may use an allocating exact fallback. The follower's `Observe`, `Local`, `Remote`, `Jitter`, `Trim` and `State` do not allocate.
+- Run `make bench` to measure performance on your machine. `Due`, `Claim`, `Skip`, `NextDue` and `Span.Time` do not allocate when the segment's reduced period numerator and denominator fit in `uint64` (including 48000/1 and 30000/1001 at ±50 ppm); other rates or trims may use an allocating exact fallback. The follower's `Observe`, `Local`, `Remote`, `Jitter`, `Trim` and `State` do not allocate.
 
 ### Concurrency
 
@@ -256,7 +256,7 @@ The loop equations, and every rule above in full, are in the [specification](htt
    ```sh
    go test -run TestDifferential
    ```
-   The test fails immediately. It shows what the pacer returned, what the reference returned, and the operations that led there. Undo the change with `git checkout pacer.go`.
+   The test fails immediately. It shows what the pacer returned, what the reference returned, and the operations that led there. Undo only your experimental edit; do not discard unrelated work.
 4. Measure it on your machine. `make bench` reports the cost of each call, including the same slot times computed with `big.Rat` for comparison. `cmd/pllpace` runs a real pacing loop and reports the rate it achieved and how late each wake-up ran; with `-find-max` it searches for the highest rate the loop sustains:
    ```sh
    make bench
@@ -267,7 +267,7 @@ The loop equations, and every rule above in full, are in the [specification](htt
 
 ## How it compares
 
-<!-- Re-verify these facts before each publish. -->
+These tools solve related but different problems. Sources: [`x/time/rate`](https://github.com/golang/time/blob/master/rate/rate.go), [`ratelimit`](https://github.com/uber-go/ratelimit/blob/main/ratelimit.go), and the [`facebook/time` PI servo](https://github.com/facebook/time/blob/main/servo/pi.go).
 
 | | pll | [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) | [go.uber.org/ratelimit](https://pkg.go.dev/go.uber.org/ratelimit) | [facebook/time servo](https://pkg.go.dev/github.com/facebook/time/servo) |
 |---|---|---|---|---|
@@ -275,10 +275,8 @@ The loop equations, and every rule above in full, are in the [specification](htt
 | Method | Exact rational schedule; type-II phase-locked loop | Token bucket | Leaky bucket | PI servo |
 | Rate | Exact fraction of units per second, with a trim | `float64` events per second, with a burst size | Events per period, with optional slack | Not applicable |
 | Waiting | You wake up; `Due` says what is due | `Allow`, `Reserve` or a blocking `Wait` | `Take` sleeps until the next event is allowed | Not applicable |
-| Time source | Passed in | `time.Now`, or a time passed to the `…At` methods | A `Clock`, replaceable for tests | Offsets passed in |
+| Time source | Passed in | `time.Now`, or an explicit time for `AllowN`, `ReserveN` and `…At` methods | A `Clock`, replaceable for tests | Offsets passed in |
 | Follows another clock | Yes, from readings, with windowing, outlier rejection, steps and holdover | No | No | Yes, from clock offsets, with a spike filter and holdover state |
-
-Outside Go, delay-locked loops such as PipeWire's [`spa_dll`](https://docs.pipewire.org/dll_8h_source.html) and FFmpeg's [`timefilter`](https://ffbox0-bg.ffmpeg.org/doxygen/4.4/timefilter_8h_source.html) filter a device's clock against the system clock, configured by a single bandwidth.
 
 **When to choose something else:**
 - If you want to limit how often something happens, with bursts allowed, `x/time/rate` is the standard choice; pll spaces slots evenly and has no burst allowance.

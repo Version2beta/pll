@@ -2,9 +2,12 @@
 
 One entry per released version, newest first.
 
-## v0.4.0 — 2026-11-12
+## v0.4.0 — 2026-11-22
 
 - `cmd/pllpace`: a real-time pacing loop that reports the rate it achieved and how late each wake-up ran. It can compare one timer tick per unit, send units over UDP, and search for the highest rate it sustains (`-find-max`).
+- Follower boundary fixes: failed observations leave state unchanged on overflow; extreme finite loop gains remain stable; mappings support displacements wider than `int64`; trim and reported phase errors saturate safely. Mapping rounding is specified relative to the integer anchor. No exported signatures changed.
+- Pacing-tool validation rejects invalid flags and unrepresentable ticker periods before opening sockets. Trials include final partial writes, stop on writer errors or short writes, and do not carry buffered bytes into later trials. Maximum-rate searches terminate at adjacent integer bit rates and report the resolution limit.
+- Clarified exact-floor versus due-time rounding, fast-path allocation limits, and read-only span ownership; added boundary regressions and independent simulator-total checks.
 - Benchmarks comparing slot times read from a `Span` with the same times computed with `big.Rat`.
 
 ## v0.3.2 — 2026-11-12
